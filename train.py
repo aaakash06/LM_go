@@ -1,4 +1,4 @@
-from __future__ import annotations
+from dataclasses import dataclass
 
 import torch
 
@@ -6,223 +6,184 @@ from src.data import make_dataloaders
 from src.model import (
     TransformerConfig,
     TransformerLM,
+    count_parameters,
 )
 from src.optimizer import AdamW
-from src.tokenizer import (
-    CharacterTokenizer,
-)
+from src.tokenizer import CharacterTokenizer
 from src.training import (
-    TrainConfig,
     get_device,
-    train,
+    set_seed,
 )
+from src.evaluation import evaluate, perplexity
 
-
-# --------------------------------------------------
-# 1. Tiny corpus
-# --------------------------------------------------
 
 TEXT = """
-The language model learns to predict the next token.
-A transformer reads a sequence of tokens and produces
-a probability distribution over the vocabulary.
+The transformer architecture processes sequences using attention.
+Attention allows each position to interact with earlier positions.
+A language model learns to predict the next token from context.
 
-Language modeling is a simple objective with deep
-consequences. Given a sequence of tokens, the model
-tries to predict what comes next.
+Small language models are useful for understanding how modern
+sequence models work. By implementing the components directly,
+we can inspect the computation and measure its behavior.
 
-The transformer uses attention to mix information
-between different positions in the sequence.
+Research experiments should control variables carefully.
+When comparing two implementations, we should keep the model,
+dataset, optimizer, learning rate, number of steps, and random seed
+fixed whenever possible.
 
-Attention allows every token to look at previous
-tokens. Causal masking prevents the model from looking
-into the future.
+Efficient attention implementations can change runtime and memory
+behavior. A reference implementation is useful for correctness.
+A fused implementation can use optimized kernels. A chunked
+implementation can reduce the amount of attention memory materialized
+at once.
 
-The model contains embeddings, attention layers,
-feed forward networks, normalization, and an output
-projection.
-
-Training repeatedly shows the model examples and
-updates its parameters using gradient descent.
-
-The goal of this small experiment is not to build a
-state of the art model. The goal is to understand the
-complete language modeling pipeline.
-
-We tokenize text, construct batches, run the model,
-compute cross entropy loss, backpropagate gradients,
-and update the parameters.
-
-Once this works, the same architecture can be scaled
-to larger datasets and larger models.
-""" * 100
+The purpose of this project is to build a language model and then
+experiment with its attention implementation.
+""" * 300
 
 
-# --------------------------------------------------
-# 2. Tokenizer
-# --------------------------------------------------
+def main():
+    print("=" * 70)
+    print("LANGUAGE MODEL RESEARCH PROJECT")
+    print("=" * 70)
 
-tokenizer = CharacterTokenizer.train(
-    TEXT
-)
+    seed = 42
 
-print(
-    f"Vocabulary size: "
-    f"{tokenizer.vocab_size}"
-)
+    set_seed(seed)
 
+    device = get_device()
 
-# --------------------------------------------------
-# 3. Encode text
-# --------------------------------------------------
+    print(f"Device: {device}")
 
-token_ids = tokenizer.encode(
-    TEXT
-)
-
-tokens = torch.tensor(
-    token_ids,
-    dtype=torch.long,
-)
-
-print(
-    f"Number of tokens: "
-    f"{len(tokens)}"
-)
-
-
-# --------------------------------------------------
-# 4. Data
-# --------------------------------------------------
-
-SEQ_LEN = 128
-BATCH_SIZE = 16
-
-train_loader, val_loader = (
-    make_dataloaders(
-        tokens,
-        seq_len=SEQ_LEN,
-        batch_size=BATCH_SIZE,
+    tokenizer = CharacterTokenizer.train(
+        TEXT
     )
-)
 
+    tokens = tokenizer.encode(TEXT)
 
-# --------------------------------------------------
-# 5. Device
-# --------------------------------------------------
+    print(
+        f"Vocabulary size: "
+        f"{tokenizer.vocab_size}"
+    )
 
-device = get_device()
+    seq_len = 128
+    batch_size = 8
 
-print(
-    f"Using device: {device}"
-)
-
-
-# --------------------------------------------------
-# 6. Model
-# --------------------------------------------------
-
-config = TransformerConfig(
-    vocab_size=tokenizer.vocab_size,
-    max_seq_len=SEQ_LEN,
-
-    d_model=256,
-    num_layers=4,
-    num_heads=4,
-
-    d_ff=1024,
-
-    dropout=0.0,
-)
-
-model = TransformerLM(
-    config
-)
-
-num_parameters = sum(
-    parameter.numel()
-    for parameter in model.parameters()
-)
-
-print(
-    f"Parameters: "
-    f"{num_parameters:,}"
-)
-
-
-# --------------------------------------------------
-# 7. Optimizer
-# --------------------------------------------------
-
-optimizer = AdamW(
-    model.parameters(),
-    lr=3e-4,
-    weight_decay=0.1,
-)
-
-
-# --------------------------------------------------
-# 8. Training
-# --------------------------------------------------
-
-train_config = TrainConfig(
-    max_steps=1000,
-
-    learning_rate=3e-4,
-    min_learning_rate=3e-5,
-
-    warmup_steps=50,
-
-    eval_interval=100,
-    eval_steps=20,
-
-    log_interval=10,
-)
-
-
-train(
-    model,
-    optimizer,
-    train_loader,
-    config=train_config,
-    val_loader=val_loader,
-    device=device,
-)
-
-
-# --------------------------------------------------
-# 9. Generate text
-# --------------------------------------------------
-
-model.eval()
-
-prompt = "The transformer"
-
-prompt_tokens = torch.tensor(
-    [
-        tokenizer.encode(
-            prompt
+    train_loader, val_loader = (
+        make_dataloaders(
+            tokens,
+            seq_len=seq_len,
+            batch_size=batch_size,
         )
-    ],
-    dtype=torch.long,
-    device=device,
-)
+    )
 
-generated = model.generate(
-    prompt_tokens,
-    max_new_tokens=300,
-    temperature=0.8,
-    top_k=10,
-)
+    config = TransformerConfig(
+        vocab_size=tokenizer.vocab_size,
+        max_seq_len=seq_len,
+        d_model=256,
+        n_layers=4,
+        n_heads=4,
+        d_ff=1024,
+        dropout=0.0,
+        attention_type="sdpa",
+    )
 
-generated_text = tokenizer.decode(
-    generated[0].tolist()
-)
+    model = TransformerLM(config).to(
+        device
+    )
 
-print()
-print("=" * 70)
-print("GENERATED TEXT")
-print("=" * 70)
-print()
-print(generated_text)
-print()
+    print(
+        f"Parameters: "
+        f"{count_parameters(model):,}"
+    )
+
+    optimizer = AdamW(
+        model.parameters(),
+        lr=3e-4,
+        weight_decay=0.1,
+    )
+
+    model.train()
+
+    iterator = iter(train_loader)
+
+    steps = 300
+
+    for step in range(1, steps + 1):
+        try:
+            x, y = next(iterator)
+        except StopIteration:
+            iterator = iter(train_loader)
+            x, y = next(iterator)
+
+        x = x.to(device)
+        y = y.to(device)
+
+        optimizer.zero_grad()
+
+        _, loss = model(
+            x,
+            y,
+        )
+
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            1.0,
+        )
+
+        optimizer.step()
+
+        if step == 1 or step % 50 == 0:
+            print(
+                f"step {step:4d} | "
+                f"loss {loss.item():.4f}"
+            )
+
+    val_loss = evaluate(
+        model,
+        val_loader,
+        device,
+        max_batches=20,
+    )
+
+    print()
+    print(
+        f"Validation loss: {val_loss:.4f}"
+    )
+
+    print(
+        f"Perplexity: "
+        f"{perplexity(val_loss):.2f}"
+    )
+
+    prompt = "The transformer"
+
+    prompt_tokens = torch.tensor(
+        [tokenizer.encode(prompt)],
+        dtype=torch.long,
+        device=device,
+    )
+
+    generated = model.generate(
+        prompt_tokens,
+        max_new_tokens=300,
+        temperature=0.8,
+        top_k=10,
+    )
+
+    print()
+    print("=" * 70)
+    print("GENERATED TEXT")
+    print("=" * 70)
+
+    print(
+        tokenizer.decode(
+            generated[0].tolist()
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
