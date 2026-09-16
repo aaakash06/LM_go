@@ -1,75 +1,63 @@
-from __future__ import annotations
-
 import torch
-from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset, DataLoader
 
 
 class LanguageModelDataset(Dataset):
     """
-    Dataset for autoregressive next-token prediction.
+    Creates autoregressive language-modeling examples.
 
-    Given:
+    Input:
+        x[t : t+seq_len]
 
-        [a b c d e]
-
-    and seq_len=4:
-
-        input:  [a b c d]
-        target: [b c d e]
+    Target:
+        x[t+1 : t+seq_len+1]
     """
 
     def __init__(
         self,
-        tokens: Tensor,
-        seq_len: int,
-    ) -> None:
-        if tokens.ndim != 1:
-            raise ValueError(
-                "tokens must be a 1D tensor"
-            )
-
+        tokens,
+        seq_len,
+    ):
         if len(tokens) <= seq_len:
             raise ValueError(
-                "Not enough tokens for requested sequence length"
+                "Not enough tokens for the requested sequence length."
             )
 
-        self.tokens = tokens.long()
+        self.tokens = tokens
         self.seq_len = seq_len
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.tokens) - self.seq_len
 
-    def __getitem__(
-        self,
-        index: int,
-    ) -> tuple[Tensor, Tensor]:
-
+    def __getitem__(self, idx):
         x = self.tokens[
-            index : index + self.seq_len
+            idx : idx + self.seq_len
         ]
 
         y = self.tokens[
-            index + 1 : index + self.seq_len + 1
+            idx + 1 : idx + self.seq_len + 1
         ]
 
         return x, y
 
 
 def make_dataloaders(
-    tokens: Tensor,
-    *,
-    seq_len: int,
-    batch_size: int,
-    train_fraction: float = 0.9,
-) -> tuple[DataLoader, DataLoader]:
-
-    split = int(
-        len(tokens) * train_fraction
+    token_ids,
+    seq_len,
+    batch_size,
+    train_fraction=0.9,
+):
+    token_ids = torch.tensor(
+        token_ids,
+        dtype=torch.long,
     )
 
-    train_tokens = tokens[:split]
-    val_tokens = tokens[split:]
+    split = int(
+        len(token_ids) * train_fraction
+    )
+
+    train_tokens = token_ids[:split]
+    val_tokens = token_ids[split:]
 
     train_dataset = LanguageModelDataset(
         train_tokens,
@@ -85,16 +73,16 @@ def make_dataloaders(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        drop_last=True,
         num_workers=0,
+        drop_last=True,
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        drop_last=True,
         num_workers=0,
+        drop_last=True,
     )
 
     return train_loader, val_loader

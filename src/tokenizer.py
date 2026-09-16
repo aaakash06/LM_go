@@ -1,49 +1,59 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 
 @dataclass
 class CharacterTokenizer:
     """
-    Simple character-level tokenizer.
+    Tiny character-level tokenizer.
 
-    Every unique character receives an integer ID.
+    This is intentionally simple for research experiments.
     """
 
-    stoi: dict[str, int]
-    itos: dict[int, str]
+    stoi: dict
+    itos: dict
 
     @classmethod
-    def train(cls, text: str) -> "CharacterTokenizer":
-        characters = sorted(set(text))
+    def train(cls, text: str):
+        chars = sorted(set(text))
 
         stoi = {
-            character: index
-            for index, character in enumerate(characters)
+            ch: i
+            for i, ch in enumerate(chars)
         }
 
         itos = {
-            index: character
-            for character, index in stoi.items()
+            i: ch
+            for ch, i in stoi.items()
         }
 
-        return cls(stoi=stoi, itos=itos)
+        return cls(
+            stoi=stoi,
+            itos=itos,
+        )
 
     @property
-    def vocab_size(self) -> int:
+    def vocab_size(self):
         return len(self.stoi)
 
-    def encode(self, text: str) -> list[int]:
-        try:
-            return [self.stoi[c] for c in text]
-        except KeyError as exc:
-            raise ValueError(
-                f"Unknown character: {exc.args[0]!r}"
-            ) from exc
+    def encode(self, text: str):
+        unknown = [
+            ch
+            for ch in text
+            if ch not in self.stoi
+        ]
 
-    def decode(self, tokens: list[int]) -> str:
+        if unknown:
+            raise ValueError(
+                f"Unknown characters: {unknown[:10]}"
+            )
+
+        return [
+            self.stoi[ch]
+            for ch in text
+        ]
+
+    def decode(self, tokens):
         return "".join(
-            self.itos[token]
+            self.itos[int(token)]
             for token in tokens
         )

@@ -1,54 +1,40 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor, nn
 
-from .flash_attention import (
-    FlashMultiHeadSelfAttention,
-)
+from .attention import ReferenceCausalSelfAttention
+from .flash_attention import SDPACAusalSelfAttention
+from .chunked_attention import ChunkedCausalSelfAttention
 
 
 @dataclass
 class TransformerConfig:
     vocab_size: int
-    max_seq_len: int
+
+    max_seq_len: int = 128
 
     d_model: int = 256
-    num_layers: int = 4
-    num_heads: int = 4
-
+    n_layers: int = 4
+    n_heads: int = 4
     d_ff: int = 1024
 
     dropout: float = 0.0
 
+    attention_type: str = "sdpa"
+    chunk_size: int = 128
+
 
 class RMSNorm(nn.Module):
-
-    def __init__(
-        self,
-        d_model: int,
-        eps: float = 1e-5,
-    ) -> None:
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
 
+        self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
-        self.weight = nn.Parameter(
-            torch.ones(d_model)
-        )
-
-    def forward(
-        self,
-        x: Tensor,
-    ) -> Tensor:
-
-        variance = x.float().pow(2).mean(
-            dim=-1,
-            keepdim=True,
-        )
+    def forward(self, x):
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
 
         x = x * torch.rsqrt(
             variance + self.eps
@@ -57,89 +43,69 @@ class RMSNorm(nn.Module):
         return self.weight * x
 
 
-class FeedForward(nn.Module):
-
-    def __init__(
-        self,
-        d_model: int,
-        d_ff: int,
-        dropout: float,
-    ) -> None:
+class SwiGLU(nn.Module):
+    def __init__(self, d_model: int, d_ff: int):
         super().__init__()
 
-        self.w1 = nn.Linear(
-            d_model,
-            d_ff,
+        self.w1 = nn.Linear(d_model, d_ff, bias=False)
+        self.w2 = nn.Linear(d_model, d_ff, bias=False)
+        self.w3 = nn.Linear(d_ff, d_model, bias=False)
+
+    def forward(self, x):
+        return self.w3(
+            F.silu(self.w1(x)) * self.w2(x)
         )
 
-        self.w2 = nn.Linear(
-            d_model,
-            d_ff,
+
+def build_attention(config: TransformerConfig):
+    if config.attention_type == "reference":
+        return ReferenceCausalSelfAttention(
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            dropout=config.dropout,
         )
 
-        self.w3 = nn.Linear(
-            d_ff,
-            d_model,
+    if config.attention_type == "sdpa":
+        return SDPACAusalSelfAttention(
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            dropout=config.dropout,
         )
 
-        self.dropout = nn.Dropout(
-            dropout
+    if config.attention_type == "chunked":
+        return ChunkedCausalSelfAttention(
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            dropout=config.dropout,
+            chunk_size=config.chunk_size,
         )
 
-    def forward(
-        self,
-        x: Tensor,
-    ) -> Tensor:
-
-        x = F.silu(
-            self.w1(x)
-        ) * self.w2(x)
-
-        return self.dropout(
-            self.w3(x)
-        )
+    raise ValueError(
+        f"Unknown attention_type: {config.attention_type}"
+    )
 
 
 class TransformerBlock(nn.Module):
-
-    def __init__(
-        self,
-        config: TransformerConfig,
-    ) -> None:
+    def __init__(self, config: TransformerConfig):
         super().__init__()
 
-        self.norm1 = RMSNorm(
-            config.d_model
-        )
+        self.norm1 = RMSNorm(config.d_model)
 
-        self.attention = (
-            FlashMultiHeadSelfAttention(
-                d_model=config.d_model,
-                num_heads=config.num_heads,
-                dropout=config.dropout,
-            )
-        )
+        self.attention = build_attention(config)
 
-        self.norm2 = RMSNorm(
-            config.d_model
-        )
+        self.norm2 = RMSNorm(config.d_model)
 
-        self.feed_forward = FeedForward(
+        self.mlp = SwiGLU(
             config.d_model,
             config.d_ff,
-            config.dropout,
         )
 
-    def forward(
-        self,
-        x: Tensor,
-    ) -> Tensor:
-
+    def forward(self, x):
         x = x + self.attention(
             self.norm1(x)
         )
 
-        x = x + self.feed_forward(
+        x = x + self.mlp(
             self.norm2(x)
         )
 
@@ -147,11 +113,7 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerLM(nn.Module):
-
-    def __init__(
-        self,
-        config: TransformerConfig,
-    ) -> None:
+    def __init__(self, config: TransformerConfig):
         super().__init__()
 
         self.config = config
@@ -166,20 +128,14 @@ class TransformerLM(nn.Module):
             config.d_model,
         )
 
-        self.dropout = nn.Dropout(
-            config.dropout
-        )
-
-        self.layers = nn.ModuleList(
+        self.blocks = nn.ModuleList(
             [
                 TransformerBlock(config)
-                for _ in range(config.num_layers)
+                for _ in range(config.n_layers)
             ]
         )
 
-        self.final_norm = RMSNorm(
-            config.d_model
-        )
+        self.norm = RMSNorm(config.d_model)
 
         self.lm_head = nn.Linear(
             config.d_model,
@@ -188,21 +144,12 @@ class TransformerLM(nn.Module):
         )
 
         # Weight tying.
-        self.lm_head.weight = (
-            self.token_embedding.weight
-        )
+        self.lm_head.weight = self.token_embedding.weight
 
         self.apply(self._init_weights)
 
-    def _init_weights(
-        self,
-        module: nn.Module,
-    ) -> None:
-
-        if isinstance(
-            module,
-            nn.Linear,
-        ):
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
             nn.init.normal_(
                 module.weight,
                 mean=0.0,
@@ -210,51 +157,38 @@ class TransformerLM(nn.Module):
             )
 
             if module.bias is not None:
-                nn.init.zeros_(
-                    module.bias
-                )
+                nn.init.zeros_(module.bias)
 
-        elif isinstance(
-            module,
-            nn.Embedding,
-        ):
+        elif isinstance(module, nn.Embedding):
             nn.init.normal_(
                 module.weight,
                 mean=0.0,
                 std=0.02,
             )
 
-    def forward(
-        self,
-        tokens: Tensor,
-        targets: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor | None]:
+    def forward(self, input_ids, targets=None):
+        B, T = input_ids.shape
 
-        batch_size, seq_len = tokens.shape
-
-        if seq_len > self.config.max_seq_len:
+        if T > self.config.max_seq_len:
             raise ValueError(
-                "Sequence is longer than max_seq_len"
+                f"Sequence length {T} exceeds "
+                f"max_seq_len={self.config.max_seq_len}"
             )
 
         positions = torch.arange(
-            seq_len,
-            device=tokens.device,
+            T,
+            device=input_ids.device,
         )
 
         x = (
-            self.token_embedding(tokens)
-            + self.position_embedding(
-                positions
-            )
+            self.token_embedding(input_ids)
+            + self.position_embedding(positions)
         )
 
-        x = self.dropout(x)
+        for block in self.blocks:
+            x = block(x)
 
-        for layer in self.layers:
-            x = layer(x)
-
-        x = self.final_norm(x)
+        x = self.norm(x)
 
         logits = self.lm_head(x)
 
@@ -262,10 +196,7 @@ class TransformerLM(nn.Module):
 
         if targets is not None:
             loss = F.cross_entropy(
-                logits.reshape(
-                    -1,
-                    logits.size(-1),
-                ),
+                logits.reshape(-1, logits.size(-1)),
                 targets.reshape(-1),
             )
 
@@ -274,42 +205,39 @@ class TransformerLM(nn.Module):
     @torch.no_grad()
     def generate(
         self,
-        tokens: Tensor,
-        max_new_tokens: int,
-        temperature: float = 1.0,
-        top_k: int | None = None,
-    ) -> Tensor:
-
+        input_ids,
+        max_new_tokens,
+        temperature=1.0,
+        top_k=None,
+    ):
         self.eval()
 
         for _ in range(max_new_tokens):
-
-            tokens_cond = tokens[
-                :,
-                -self.config.max_seq_len :,
+            idx_cond = input_ids[
+                :, -self.config.max_seq_len:
             ]
 
-            logits, _ = self(
-                tokens_cond
-            )
+            logits, _ = self(idx_cond)
 
             logits = logits[:, -1, :]
+
+            if temperature <= 0:
+                raise ValueError(
+                    "temperature must be positive"
+                )
 
             logits = logits / temperature
 
             if top_k is not None:
                 values, _ = torch.topk(
                     logits,
-                    min(
-                        top_k,
-                        logits.size(-1),
-                    ),
+                    min(top_k, logits.size(-1)),
                 )
 
-                threshold = values[:, [-1]]
+                cutoff = values[:, [-1]]
 
                 logits = torch.where(
-                    logits < threshold,
+                    logits < cutoff,
                     torch.full_like(
                         logits,
                         float("-inf"),
@@ -317,22 +245,27 @@ class TransformerLM(nn.Module):
                     logits,
                 )
 
-            probabilities = torch.softmax(
+            probs = F.softmax(
                 logits,
                 dim=-1,
             )
 
             next_token = torch.multinomial(
-                probabilities,
+                probs,
                 num_samples=1,
             )
 
-            tokens = torch.cat(
-                [
-                    tokens,
-                    next_token,
-                ],
+            input_ids = torch.cat(
+                [input_ids, next_token],
                 dim=1,
             )
 
-        return tokens
+        return input_ids
+
+
+def count_parameters(model):
+    return sum(
+        p.numel()
+        for p in model.parameters()
+        if p.requires_grad
+    )

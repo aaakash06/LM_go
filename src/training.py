@@ -1,38 +1,13 @@
-from __future__ import annotations
-
 import math
+import os
 import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable
 
 import torch
-from torch import nn
-from torch.optim import Optimizer
+
+from .evaluation import evaluate, perplexity
 
 
-@dataclass
-class TrainConfig:
-
-    max_steps: int = 1000
-
-    learning_rate: float = 3e-4
-    min_learning_rate: float = 3e-5
-
-    warmup_steps: int = 50
-
-    grad_clip: float = 1.0
-
-    eval_interval: int = 100
-    eval_steps: int = 20
-
-    log_interval: int = 10
-
-    checkpoint_dir: str = "checkpoints"
-
-
-def get_device() -> torch.device:
-
+def get_device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
 
@@ -42,91 +17,58 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def get_lr(
-    step: int,
-    config: TrainConfig,
-) -> float:
+def set_seed(seed):
+    torch.manual_seed(seed)
 
-    if step < config.warmup_steps:
-        return (
-            config.learning_rate
-            * (step + 1)
-            / config.warmup_steps
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def cosine_lr(
+    step,
+    max_steps,
+    warmup_steps,
+    max_lr,
+    min_lr,
+):
+    if step < warmup_steps:
+        return max_lr * (
+            step / max(1, warmup_steps)
         )
-
-    if step >= config.max_steps:
-        return config.min_learning_rate
 
     progress = (
-        step - config.warmup_steps
-    ) / (
-        config.max_steps
-        - config.warmup_steps
+        step - warmup_steps
+    ) / max(
+        1,
+        max_steps - warmup_steps,
     )
 
-    cosine = 0.5 * (
-        1 + math.cos(
-            math.pi * progress
-        )
+    progress = min(
+        max(progress, 0.0),
+        1.0,
+    )
+
+    coefficient = 0.5 * (
+        1.0
+        + math.cos(math.pi * progress)
     )
 
     return (
-        config.min_learning_rate
-        + cosine
-        * (
-            config.learning_rate
-            - config.min_learning_rate
-        )
-    )
-
-
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: Iterable,
-    *,
-    device: torch.device,
-    max_steps: int,
-) -> float:
-
-    model.eval()
-
-    total_loss = 0.0
-
-    for step, (inputs, targets) in enumerate(
-        loader
-    ):
-
-        if step >= max_steps:
-            break
-
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-
-        _, loss = model(
-            inputs,
-            targets,
-        )
-
-        total_loss += loss.item()
-
-    model.train()
-
-    return total_loss / min(
-        max_steps,
-        step + 1,
+        min_lr
+        + coefficient
+        * (max_lr - min_lr)
     )
 
 
 def save_checkpoint(
-    path: str | Path,
-    model: nn.Module,
-    optimizer: Optimizer,
-    step: int,
-) -> None:
-
-    Path(path).parent.mkdir(
-        parents=True,
+    path,
+    model,
+    optimizer,
+    step,
+    config,
+):
+    os.makedirs(
+        os.path.dirname(path) or ".",
         exist_ok=True,
     )
 
@@ -135,126 +77,160 @@ def save_checkpoint(
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "step": step,
+            "config": config,
         },
         path,
     )
 
 
-def train(
-    model: nn.Module,
-    optimizer: Optimizer,
-    train_loader: Iterable,
-    *,
-    config: TrainConfig,
-    val_loader: Iterable | None = None,
-    device: torch.device | None = None,
-) -> None:
-
-    if device is None:
-        device = get_device()
-
-    model.to(device)
-
-    model.train()
-
-    train_iterator = iter(
-        train_loader
+def load_checkpoint(
+    path,
+    model,
+    optimizer=None,
+):
+    checkpoint = torch.load(
+        path,
+        map_location="cpu",
     )
 
-    start_time = time.time()
+    model.load_state_dict(
+        checkpoint["model"]
+    )
 
-    for step in range(
-        config.max_steps
-    ):
+    if optimizer is not None:
+        optimizer.load_state_dict(
+            checkpoint["optimizer"]
+        )
 
+    return checkpoint["step"]
+
+
+def train(
+    model,
+    optimizer,
+    train_loader,
+    config,
+    device,
+    val_loader=None,
+    checkpoint_dir=None,
+):
+    model.train()
+
+    iterator = iter(train_loader)
+
+    start_time = time.perf_counter()
+
+    history = []
+
+    for step in range(1, config.max_steps + 1):
         try:
-            inputs, targets = next(
-                train_iterator
-            )
-
+            x, y = next(iterator)
         except StopIteration:
-            train_iterator = iter(
-                train_loader
-            )
+            iterator = iter(train_loader)
+            x, y = next(iterator)
 
-            inputs, targets = next(
-                train_iterator
-            )
+        x = x.to(device)
+        y = y.to(device)
 
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-
-        lr = get_lr(
+        lr = cosine_lr(
             step,
-            config,
+            config.max_steps,
+            config.warmup_steps,
+            config.learning_rate,
+            config.min_learning_rate,
         )
 
         for group in optimizer.param_groups:
             group["lr"] = lr
 
-        optimizer.zero_grad(
-            set_to_none=True
-        )
+        optimizer.zero_grad()
 
         _, loss = model(
-            inputs,
-            targets,
+            x,
+            y,
         )
 
         loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            config.grad_clip,
-        )
+        if config.grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                config.grad_clip,
+            )
 
         optimizer.step()
 
         if (
-            step % config.log_interval == 0
+            step % config.log_every == 0
+            or step == 1
         ):
             elapsed = (
-                time.time()
+                time.perf_counter()
                 - start_time
+            )
+
+            tokens_processed = (
+                step
+                * x.numel()
+            )
+
+            tokens_per_second = (
+                tokens_processed
+                / max(elapsed, 1e-9)
             )
 
             print(
                 f"step {step:5d} | "
                 f"loss {loss.item():.4f} | "
                 f"lr {lr:.2e} | "
-                f"time {elapsed:.1f}s"
+                f"tok/s {tokens_per_second:,.0f}"
             )
 
         if (
             val_loader is not None
-            and step > 0
-            and step
-            % config.eval_interval
-            == 0
+            and (
+                step % config.eval_every == 0
+                or step == config.max_steps
+            )
         ):
-
             val_loss = evaluate(
                 model,
                 val_loader,
-                device=device,
-                max_steps=config.eval_steps,
+                device,
+                max_batches=config.eval_batches,
             )
 
-            perplexity = math.exp(
-                min(val_loss, 20)
-            )
+            val_ppl = perplexity(val_loss)
 
             print(
-                f"           "
-                f"val loss {val_loss:.4f} | "
-                f"ppl {perplexity:.2f}"
+                f"           validation loss "
+                f"{val_loss:.4f} | "
+                f"perplexity {val_ppl:.2f}"
             )
 
+            history.append(
+                {
+                    "step": step,
+                    "train_loss": loss.item(),
+                    "val_loss": val_loss,
+                    "val_perplexity": val_ppl,
+                    "learning_rate": lr,
+                }
+            )
+
+        if (
+            checkpoint_dir is not None
+            and step % config.checkpoint_every == 0
+        ):
             save_checkpoint(
-                Path(
-                    config.checkpoint_dir
-                ) / "latest.pt",
+                os.path.join(
+                    checkpoint_dir,
+                    f"step_{step}.pt",
+                ),
                 model,
                 optimizer,
                 step,
+                config.__dict__,
             )
+
+    return history

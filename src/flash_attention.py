@@ -1,86 +1,61 @@
-from __future__ import annotations
-
 import torch
-from torch import Tensor, nn
+import torch.nn as nn
 import torch.nn.functional as F
 
 
-class FlashMultiHeadSelfAttention(nn.Module):
+class SDPACAusalSelfAttention(nn.Module):
     """
-    Optimized multi-head self-attention using PyTorch's
-    scaled_dot_product_attention.
+    Causal self-attention using PyTorch's scaled_dot_product_attention.
 
-    PyTorch chooses an appropriate implementation for the current device.
-
-    Despite the name, this should be thought of as an optimized attention
-    implementation rather than assuming that a particular CUDA FlashAttention
-    kernel is available on every device.
+    On supported hardware/backends PyTorch may select a fused implementation.
     """
 
     def __init__(
         self,
         d_model: int,
-        num_heads: int,
-        *,
+        n_heads: int,
         dropout: float = 0.0,
-        bias: bool = True,
-    ) -> None:
+    ):
         super().__init__()
 
-        if d_model % num_heads != 0:
-            raise ValueError(
-                f"d_model ({d_model}) must be divisible by "
-                f"num_heads ({num_heads})"
-            )
+        if d_model % n_heads != 0:
+            raise ValueError("d_model must be divisible by n_heads")
 
         self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.dropout_p = dropout
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.dropout = dropout
 
-        # Fused QKV projection.
-        self.qkv_proj = nn.Linear(
-            d_model,
-            3 * d_model,
-            bias=bias,
-        )
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
 
-        self.out_proj = nn.Linear(
-            d_model,
-            d_model,
-            bias=bias,
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        batch_size, seq_len, _ = x.shape
+    def _split_qkv(self, x):
+        B, T, _ = x.shape
 
         qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
 
-        # [B, T, 3D]
-        # -> [B, T, 3, H, D/H]
-        qkv = qkv.view(
-            batch_size,
-            seq_len,
-            3,
-            self.num_heads,
-            self.head_dim,
-        )
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # -> [3, B, H, T, D/H]
-        qkv = qkv.permute(2, 0, 3, 1, 4)
+        return q, k, v
 
-        q, k, v = qkv.unbind(dim=0)
+    def forward(self, x):
+        q, k, v = self._split_qkv(x)
+
+        dropout_p = self.dropout if self.training else 0.0
 
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=None,
-            dropout_p=self.dropout_p if self.training else 0.0,
+            dropout_p=dropout_p,
+            is_causal=True,
         )
 
-        # [B, H, T, D/H] -> [B, T, D]
         y = y.transpose(1, 2).contiguous()
-        y = y.view(batch_size, seq_len, self.d_model)
+        y = y.view(x.shape[0], x.shape[1], self.d_model)
 
         return self.out_proj(y)
