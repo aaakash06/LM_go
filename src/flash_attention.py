@@ -24,7 +24,6 @@ class FlashMultiHeadSelfAttention(nn.Module):
         *,
         dropout: float = 0.0,
         bias: bool = True,
-        causal: bool = True,
     ) -> None:
         super().__init__()
 
@@ -38,7 +37,6 @@ class FlashMultiHeadSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.dropout_p = dropout
-        self.causal = causal
 
         # Fused QKV projection.
         self.qkv_proj = nn.Linear(
@@ -79,7 +77,6 @@ class FlashMultiHeadSelfAttention(nn.Module):
             v,
             attn_mask=None,
             dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=self.causal,
         )
 
         # [B, H, T, D/H] -> [B, T, D]

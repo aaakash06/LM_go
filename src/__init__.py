@@ -1,12 +1,17 @@
-from .attention import MultiHeadSelfAttention
-from .flash_attention import FlashMultiHeadSelfAttention
-from .model import TransformerConfig, TransformerLM
+from .model import (
+    TransformerConfig,
+    TransformerLM,
+)
+
 from .optimizer import AdamW
 
+from .tokenizer import (
+    CharacterTokenizer,
+)
+
 __all__ = [
-    "MultiHeadSelfAttention",
-    "FlashMultiHeadSelfAttention",
     "TransformerConfig",
     "TransformerLM",
     "AdamW",
+    "CharacterTokenizer",
 ]
